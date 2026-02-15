@@ -1,7 +1,7 @@
 import azure.functions as func
 import logging
 import requests
-from datetime import datetime
+import json
 
 from predict import predict_leak
 from prescribe import predict_leak as prescribe_predict
@@ -21,29 +21,30 @@ THINGSPEAK_URL = (
 )
 
 # ==========================
-# TIMER TRIGGER FUNCTION
+# TIMER TRIGGER
+# Every 1 Minute
 # ==========================
 
 @app.function_name(name="digitalTwinTimer")
-@app.timer_trigger(schedule="0 */1 * * * *", arg_name="myTimer", run_on_startup=False)
+@app.timer_trigger(schedule="0 */1 * * * *", arg_name="myTimer")
 def digitalTwinTimer(myTimer: func.TimerRequest) -> None:
 
     logging.info("Digital Twin Timer Trigger Started")
 
     try:
-        response = requests.get(THINGSPEAK_URL)
+        response = requests.get(THINGSPEAK_URL, timeout=10)
+        response.raise_for_status()
         data = response.json()
 
         timestamp = data.get("created_at")
 
-        # Read sensor values
         sensors = [
             ("Sensor_1", data.get("field1"), data.get("field2")),
             ("Sensor_2", data.get("field3"), data.get("field4")),
             ("Sensor_3", data.get("field5"), data.get("field6")),
         ]
 
-        results = []
+        final_results = []
 
         for name, pressure, flow in sensors:
 
@@ -56,16 +57,20 @@ def digitalTwinTimer(myTimer: func.TimerRequest) -> None:
             prediction = predict_leak(pressure, flow)
             prescription = prescribe_predict(pressure, flow)
 
-            results.append({
+            sensor_result = {
                 "sensor": name,
                 "pressure_bar": pressure,
                 "flow_lpm": flow,
                 "prediction": prediction,
                 "prescription": prescription
-            })
+            }
 
+            final_results.append(sensor_result)
+
+        logging.info("===================================")
         logging.info(f"Timestamp: {timestamp}")
-        logging.info(f"Results: {results}")
+        logging.info(json.dumps(final_results, indent=2))
+        logging.info("===================================")
 
     except Exception as e:
         logging.error(f"Error occurred: {str(e)}")
