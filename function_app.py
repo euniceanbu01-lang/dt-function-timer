@@ -3,14 +3,16 @@ import os
 import json
 import datetime
 import requests
-import pandas as pd
-import joblib
 import azure.functions as func
 from azure.storage.blob import BlobServiceClient
 
+from predict import predict_leak
+from prescribe import get_prescription
+
 app = func.FunctionApp()
 
-@app.timer_trigger(schedule="0 */1 * * * *", arg_name="myTimer", run_on_startup=False, use_monitor=True)
+@app.timer_trigger(schedule="0 */1 * * * *", arg_name="myTimer",
+                   run_on_startup=False, use_monitor=True)
 def digitalTwinTimer(myTimer: func.TimerRequest) -> None:
 
     logging.info("Digital Twin Timer Triggered")
@@ -28,13 +30,7 @@ def digitalTwinTimer(myTimer: func.TimerRequest) -> None:
         AZURE_STORAGE_CONNECTION_STRING
     )
 
-    raw_container = blob_service_client.get_container_client("digital-twin-raw")
     processed_container = blob_service_client.get_container_client("digital-twin-processed")
-
-    try:
-        raw_container.create_container()
-    except:
-        pass
 
     try:
         processed_container.create_container()
@@ -45,45 +41,55 @@ def digitalTwinTimer(myTimer: func.TimerRequest) -> None:
     data = response.json()
     feed = data["feeds"][-1]
 
-    bundle = joblib.load("model.joblib")
-    model = bundle["model"]
-    threshold = bundle["threshold"]
-
     timestamp = datetime.datetime.utcnow().isoformat()
     filename_time = datetime.datetime.utcnow().strftime("%Y-%m-%d_%H-%M-%S")
 
-    pressure = float(feed.get("field1", 45))
-    flow = float(feed.get("field2", 100))
+    # -------- 3 Sensor Pairs --------
+    pressures = [
+        float(feed.get("field1", 0)),
+        float(feed.get("field3", 0)),
+        float(feed.get("field5", 0))
+    ]
 
-    raw_output = {
-        "timestamp": timestamp,
-        "pressure": pressure,
-        "flow": flow
-    }
+    flows = [
+        float(feed.get("field2", 0)),
+        float(feed.get("field4", 0)),
+        float(feed.get("field6", 0))
+    ]
 
-    pressure_psi = pressure * 14.5038
-    flow_gpm = flow / 3.78541
+    sensors_output = []
 
-    X = pd.DataFrame([[pressure_psi, flow_gpm]],
-                     columns=["Pressure", "Flow_Rate"])
+    for i in range(3):
 
-    prob = model.predict_proba(X)[0][1]
-    leak = int(prob >= threshold)
+        prediction = predict_leak(pressures[i], flows[i])
+
+        if prediction["leak"] == 1:
+            prescription = get_prescription(
+                prediction["leak_mm"],
+                prediction["leak_lpm"]
+            )
+        else:
+            prescription = {"message": "System normal"}
+
+        sensors_output.append({
+            "sensor_id": f"S{i+1}",
+            "pressure": pressures[i],
+            "flow": flows[i],
+            "leak": prediction["leak"],
+            "probability": prediction["prob"],
+            "leak_lpm": prediction["leak_lpm"],
+            "leak_mm": prediction["leak_mm"],
+            "prescription": prescription
+        })
 
     processed_output = {
         "timestamp": timestamp,
-        "leak": leak,
-        "probability": float(prob)
+        "sensors": sensors_output
     }
 
-    raw_container.upload_blob(
-        f"{filename_time}_raw.json",
-        json.dumps(raw_output),
-        overwrite=True
-    )
-
+    # Save latest file
     processed_container.upload_blob(
-        f"{filename_time}_processed.json",
+        "latest_prediction.json",
         json.dumps(processed_output),
         overwrite=True
     )
