@@ -1,97 +1,120 @@
 import logging
-import os
-import json
-import datetime
-import requests
 import azure.functions as func
-from azure.storage.blob import BlobServiceClient
+import requests
+import os
+import pandas as pd
+from datetime import datetime
 
 from predict import predict_leak
-from prescribe import get_prescription
 
 app = func.FunctionApp()
 
-@app.timer_trigger(schedule="0 */1 * * * *", arg_name="myTimer",
-                   run_on_startup=False, use_monitor=True)
-def digitalTwinTimer(myTimer: func.TimerRequest) -> None:
+# ----------------------------
+# ThingSpeak Configuration
+# ----------------------------
+CHANNEL_ID = "3149051"
+READ_API_KEY = "NWKBNFL3252PISBY"
 
-    logging.info("Digital Twin Timer Triggered")
+THINGSPEAK_URL = f"https://api.thingspeak.com/channels/{CHANNEL_ID}/feeds/last.json?api_key={READ_API_KEY}"
 
-    CHANNEL_ID = os.getenv("CHANNEL_ID")
-    READ_API_KEY = os.getenv("READ_API_KEY")
-    AZURE_STORAGE_CONNECTION_STRING = os.getenv("AZURE_STORAGE_CONNECTION_STRING")
+# ----------------------------
+# Load Prescription Table
+# ----------------------------
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+PRESCRIPTION_PATH = os.path.join(BASE_DIR, "prescription.csv")
 
-    THINGSPEAK_URL = (
-        f"https://api.thingspeak.com/channels/{CHANNEL_ID}/feeds.json"
-        f"?api_key={READ_API_KEY}&results=1"
-    )
+prescription_df = pd.read_csv(PRESCRIPTION_PATH)
 
-    blob_service_client = BlobServiceClient.from_connection_string(
-        AZURE_STORAGE_CONNECTION_STRING
-    )
 
-    processed_container = blob_service_client.get_container_client("digital-twin-processed")
+def get_prescription(leak_mm):
+    """
+    Match leak size to prescription table
+    WITHOUT changing threshold logic.
+    """
+    if leak_mm == 0:
+        return "No action required"
+
+    # Assuming prescription.csv has columns like:
+    # min_mm, max_mm, action
+    for _, row in prescription_df.iterrows():
+        if row["min_mm"] <= leak_mm <= row["max_mm"]:
+            return row["action"]
+
+    return "Inspect manually"
+
+
+@app.route(route="run-digital-twin", methods=["GET"])
+def run_digital_twin(req: func.HttpRequest) -> func.HttpResponse:
+
+    logging.info("Digital Twin HTTP trigger started")
 
     try:
-        processed_container.create_container()
-    except:
-        pass
+        # ----------------------------
+        # 1. Fetch Latest Sensor Data
+        # ----------------------------
+        response = requests.get(THINGSPEAK_URL)
+        data = response.json()
 
-    response = requests.get(THINGSPEAK_URL)
-    data = response.json()
-    feed = data["feeds"][-1]
+        timestamp = data["created_at"]
 
-    timestamp = datetime.datetime.utcnow().isoformat()
-    filename_time = datetime.datetime.utcnow().strftime("%Y-%m-%d_%H-%M-%S")
+        sensors = [
+            {
+                "name": "Sensor_1",
+                "pressure": float(data["field1"]),
+                "flow": float(data["field2"])
+            },
+            {
+                "name": "Sensor_2",
+                "pressure": float(data["field3"]),
+                "flow": float(data["field4"])
+            },
+            {
+                "name": "Sensor_3",
+                "pressure": float(data["field5"]),
+                "flow": float(data["field6"])
+            }
+        ]
 
-    # -------- 3 Sensor Pairs --------
-    pressures = [
-        float(feed.get("field1", 0)),
-        float(feed.get("field3", 0)),
-        float(feed.get("field5", 0))
-    ]
+        results = []
 
-    flows = [
-        float(feed.get("field2", 0)),
-        float(feed.get("field4", 0)),
-        float(feed.get("field6", 0))
-    ]
+        # ----------------------------
+        # 2. Run Prediction + Prescription
+        # ----------------------------
+        for sensor in sensors:
 
-    sensors_output = []
-
-    for i in range(3):
-
-        prediction = predict_leak(pressures[i], flows[i])
-
-        if prediction["leak"] == 1:
-            prescription = get_prescription(
-                prediction["leak_mm"],
-                prediction["leak_lpm"]
+            prediction = predict_leak(
+                sensor["pressure"],
+                sensor["flow"]
             )
-        else:
-            prescription = {"message": "System normal"}
 
-        sensors_output.append({
-            "sensor_id": f"S{i+1}",
-            "pressure": pressures[i],
-            "flow": flows[i],
-            "leak": prediction["leak"],
-            "probability": prediction["prob"],
-            "leak_lpm": prediction["leak_lpm"],
-            "leak_mm": prediction["leak_mm"],
-            "prescription": prescription
-        })
+            prescription = get_prescription(prediction["leak_mm"])
 
-    processed_output = {
-        "timestamp": timestamp,
-        "sensors": sensors_output
-    }
+            results.append({
+                "sensor": sensor["name"],
+                "pressure_bar": sensor["pressure"],
+                "flow_lpm": sensor["flow"],
+                "prediction": prediction,
+                "prescription": prescription
+            })
 
-    # Save latest file
-    processed_container.upload_blob(
-        "latest_prediction.json",
-        json.dumps(processed_output),
-        overwrite=True
-    )
+        output = {
+            "timestamp": timestamp,
+            "channel_id": CHANNEL_ID,
+            "results": results
+        }
 
-    logging.info("Digital Twin Execution Completed")
+        logging.info(f"Output generated: {output}")
+
+        return func.HttpResponse(
+            body=pd.Series(output).to_json(),
+            mimetype="application/json",
+            status_code=200
+        )
+
+    except Exception as e:
+        logging.error(str(e))
+        return func.HttpResponse(
+            f"Error: {str(e)}",
+            status_code=500
+        )
+
